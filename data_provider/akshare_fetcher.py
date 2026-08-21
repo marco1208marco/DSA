@@ -30,7 +30,7 @@ import random
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
 import pandas as pd
@@ -1669,29 +1669,172 @@ class AkshareFetcher(BaseFetcher):
             circuit_breaker.record_failure(sina_key, str(e))
             return None
     
+    def _compute_chip_distribution_local(self, stock_code: str) -> Optional[ChipDistribution]:
+        """
+        本地自算筹码分布，完全替代东财 stock_cyq_em。
+
+        算法：经典 CYQ 三角分布 + 换手率衰减模型
+        1. 取新浪前复权日线（ak.stock_zh_a_daily，含 turnover 换手率），约 250 个交易日
+        2. 每根K线成交量按当日 [low, high] 区间呈三角分布摊到价格带上，峰值为当日收盘价
+        3. 当日筹码在当前时点的留存权重 = ∏(1 - 后续各日换手率)（换手率衰减）
+        4. 汇总归一化得到筹码价格分布，计算获利比例、平均成本、90%/70% 集中度
+        """
+        import akshare as ak
+        import numpy as np
+
+        symbol = _to_sina_tx_symbol(stock_code)
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        # 约 250 个交易日 ≈ 1 年；往前取 420 自然日确保历史足够
+        start_date = (datetime.now() - timedelta(days=420)).strftime("%Y-%m-%d")
+
+        df = _akshare_call_with_timeout(
+            ak.stock_zh_a_daily,
+            symbol=symbol,
+            start_date=start_date.replace("-", ""),
+            end_date=end_date.replace("-", ""),
+            adjust="qfq",
+            timeout=self._history_call_timeout,
+            call_name="ak.stock_zh_a_daily",
+        )
+
+        if df is None or df.empty:
+            logger.warning(f"[筹码自算] ak.stock_zh_a_daily 返回空数据: {stock_code}")
+            return None
+
+        df = df.sort_values("date").reset_index(drop=True)
+        # 只取最近约 250 个交易日参与计算
+        df = df.tail(250).reset_index(drop=True)
+
+        required = ["low", "high", "close", "volume", "turnover"]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            logger.warning(f"[筹码自算] {stock_code} 新浪日线缺少列 {missing}，无法自算筹码")
+            return None
+
+        low = df["low"].to_numpy(dtype=float)
+        high = df["high"].to_numpy(dtype=float)
+        close = df["close"].to_numpy(dtype=float)
+        volume = df["volume"].to_numpy(dtype=float)
+        # 新浪日线 turnover 为百分比（如 1.32 表示 1.32%），转成分数
+        turnover = df["turnover"].fillna(0.0).clip(lower=0.0).to_numpy(dtype=float) / 100.0
+
+        n = len(df)
+        # 换手率衰减：每根K线的留存权重 = ∏(1 - 后续各日换手率)
+        weights = np.ones(n)
+        for i in range(n - 2, -1, -1):
+            weights[i] = weights[i + 1] * (1.0 - turnover[i + 1])
+        weights = np.clip(weights, 0.0, 1.0)
+
+        # 价格带（略扩边，保证覆盖所有K线区间）
+        price_min = float(np.min(low)) * 0.98
+        price_max = float(np.max(high)) * 1.02
+        if price_max <= price_min:
+            logger.warning(f"[筹码自算] {stock_code} 价格区间无效，无法自算筹码")
+            return None
+        bins = 250
+        bin_edges = np.linspace(price_min, price_max, bins + 1)
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+
+        # 三角分布摊派
+        density = np.zeros(bins)
+        for i in range(n):
+            lo, hi, cl = low[i], high[i], close[i]
+            w = volume[i] * weights[i]
+            if w <= 0 or hi < lo:
+                continue
+            peak = min(max(cl, lo), hi)
+            if hi - lo <= 1e-12:
+                # 当日无波动，筹码全部落在该价格
+                idx = int(np.searchsorted(bin_edges, lo, side="right") - 1)
+                idx = min(max(idx, 0), bins - 1)
+                density[idx] += w
+                continue
+            mask = (bin_centers >= lo) & (bin_centers <= hi)
+            if not mask.any():
+                continue
+            xs = bin_centers[mask]
+            pdf = np.zeros_like(xs)
+            left = xs <= peak
+            if peak > lo:
+                pdf[left] = 2.0 * (xs[left] - lo) / ((hi - lo) * (peak - lo))
+            right = xs > peak
+            if peak < hi:
+                pdf[right] = 2.0 * (hi - xs[right]) / ((hi - lo) * (hi - peak))
+            density[mask] += w * pdf
+
+        total = float(density.sum())
+        if total <= 0:
+            logger.warning(f"[筹码自算] {stock_code} 筹码总权重为 0，无法自算筹码")
+            return None
+        density = density / total
+
+        current_price = float(df["close"].iloc[-1])
+        profit_ratio = float(density[bin_centers <= current_price].sum())
+        avg_cost = float((bin_centers * density).sum())
+
+        cum = np.cumsum(density)
+
+        def percentile_price(p: float) -> float:
+            idx = int(np.searchsorted(cum, p, side="left"))
+            idx = min(idx, bins - 1)
+            return float(bin_centers[idx])
+
+        cost_90_low = percentile_price(0.05)
+        cost_90_high = percentile_price(0.95)
+        concentration_90 = (
+            (cost_90_high - cost_90_low) / (cost_90_high + cost_90_low)
+            if cost_90_high + cost_90_low > 0 else 0.0
+        )
+        cost_70_low = percentile_price(0.15)
+        cost_70_high = percentile_price(0.85)
+        concentration_70 = (
+            (cost_70_high - cost_70_low) / (cost_70_high + cost_70_low)
+            if cost_70_high + cost_70_low > 0 else 0.0
+        )
+
+        chip = ChipDistribution(
+            code=stock_code,
+            date=str(df["date"].iloc[-1])[:10],
+            source="local",
+            profit_ratio=round(profit_ratio, 4),
+            avg_cost=round(avg_cost, 2),
+            cost_90_low=round(cost_90_low, 2),
+            cost_90_high=round(cost_90_high, 2),
+            concentration_90=round(concentration_90, 4),
+            cost_70_low=round(cost_70_low, 2),
+            cost_70_high=round(cost_70_high, 2),
+            concentration_70=round(concentration_70, 4),
+        )
+
+        logger.info(
+            f"[筹码自算] {stock_code} 日期={chip.date}: 获利比例={chip.profit_ratio:.1%}, "
+            f"平均成本={chip.avg_cost}, 90%集中度={chip.concentration_90:.2%}, "
+            f"70%集中度={chip.concentration_70:.2%}"
+        )
+        return chip
+
     def get_chip_distribution(self, stock_code: str) -> Optional[ChipDistribution]:
         """
         获取筹码分布数据
-        
-        数据来源：ak.stock_cyq_em()
+
+        数据来源：本地自算（新浪前复权日线 + 三角分布 + 换手率衰减）
         包含：获利比例、平均成本、筹码集中度
-        
-        注意：ETF/指数没有筹码分布数据，会直接返回 None
-        
+        不再依赖东财 stock_cyq_em 接口（其反爬不稳定）
+
+        注意：ETF/指数/美股/港股没有筹码分布数据，会直接返回 None
+
         Args:
             stock_code: 股票代码
-            
+
         Returns:
             ChipDistribution 对象（最新一天的数据），获取失败返回 None
         """
-        import akshare as ak
-
-        # 美股没有筹码分布数据（Akshare 不支持）
+        # 美股没有筹码分布数据
         if _is_us_code(stock_code):
             logger.debug(f"[API跳过] {stock_code} 是美股，无筹码分布数据")
             return None
 
-        # 港股没有筹码分布数据（stock_cyq_em 是 A 股专属接口）
+        # 港股没有筹码分布数据
         if _is_hk_code(stock_code):
             logger.debug(f"[API跳过] {stock_code} 是港股，无筹码分布数据")
             return None
@@ -1700,49 +1843,27 @@ class AkshareFetcher(BaseFetcher):
         if _is_etf_code(stock_code):
             logger.debug(f"[API跳过] {stock_code} 是 ETF/指数，无筹码分布数据")
             return None
-        
+
         try:
             # 防封禁策略
             self._set_random_user_agent()
             self._enforce_rate_limit()
-            
-            logger.info(f"[API调用] ak.stock_cyq_em(symbol={stock_code}) 获取筹码分布...")
+
+            logger.info(f"[API调用] 本地自算筹码: {stock_code} (ak.stock_zh_a_daily)")
             import time as _time
             api_start = _time.time()
-            
-            df = ak.stock_cyq_em(symbol=stock_code)
-            
+
+            chip = self._compute_chip_distribution_local(stock_code)
+
             api_elapsed = _time.time() - api_start
-            
-            if df.empty:
-                logger.warning(f"[API返回] ak.stock_cyq_em 返回空数据, 耗时 {api_elapsed:.2f}s")
+
+            if chip is None:
+                logger.warning(f"[API返回] 本地自算筹码失败/空, 耗时 {api_elapsed:.2f}s")
                 return None
-            
-            logger.info(f"[API返回] ak.stock_cyq_em 成功: 返回 {len(df)} 天数据, 耗时 {api_elapsed:.2f}s")
-            logger.debug(f"[API返回] 筹码数据列名: {list(df.columns)}")
-            
-            # 取最新一天的数据
-            latest = df.iloc[-1]
-            
-            # 使用 realtime_types.py 中的统一转换函数
-            chip = ChipDistribution(
-                code=stock_code,
-                date=str(latest.get('日期', '')),
-                profit_ratio=safe_float(latest.get('获利比例')),
-                avg_cost=safe_float(latest.get('平均成本')),
-                cost_90_low=safe_float(latest.get('90成本-低')),
-                cost_90_high=safe_float(latest.get('90成本-高')),
-                concentration_90=safe_float(latest.get('90集中度')),
-                cost_70_low=safe_float(latest.get('70成本-低')),
-                cost_70_high=safe_float(latest.get('70成本-高')),
-                concentration_70=safe_float(latest.get('70集中度')),
-            )
-            
-            logger.info(f"[筹码分布] {stock_code} 日期={chip.date}: 获利比例={chip.profit_ratio:.1%}, "
-                       f"平均成本={chip.avg_cost}, 90%集中度={chip.concentration_90:.2%}, "
-                       f"70%集中度={chip.concentration_70:.2%}")
+
+            logger.info(f"[API返回] 本地自算筹码成功: {stock_code}, 耗时 {api_elapsed:.2f}s")
             return chip
-            
+
         except Exception as e:
             logger.error(f"[API错误] 获取 {stock_code} 筹码分布失败: {e}")
             return None
